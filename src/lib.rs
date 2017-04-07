@@ -84,6 +84,15 @@ impl<T> Stream for MultiStream<T>
     }
 }
 
+#[macro_export]
+macro_rules! multistream {
+    ($($e:expr),*) => ({
+        let mut _temp = $crate::MultiStream::new();
+        $(_temp.add($e);)*
+        _temp
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +108,20 @@ mod tests {
 
         let mut ms = MultiStream::new();
         ms.add(one); ms.add(two); ms.add(three);
+
+        assert_eq!(ms.poll(), Ok(Async::Ready(Some(1))));
+        assert_eq!(ms.poll(), Ok(Async::Ready(Some(3))));   // this is swapped to the beginning
+        assert_eq!(ms.poll(), Ok(Async::Ready(Some(2))));
+        assert_eq!(ms.poll(), Ok(Async::Ready(None)));
+    }
+
+    #[test]
+    fn test_macro() {
+        let one = once::<u32, ()>(Ok(1));
+        let two = once(Ok(2));
+        let three = once(Ok(3));
+
+        let mut ms = multistream![one, two, three];
 
         assert_eq!(ms.poll(), Ok(Async::Ready(Some(1))));
         assert_eq!(ms.poll(), Ok(Async::Ready(Some(3))));   // this is swapped to the beginning
