@@ -1,6 +1,9 @@
 extern crate futures;
 
-use futures::{Async, Poll, Stream};
+use futures::{Async, Poll, Sink, Stream};
+use futures::sink::BoxSink;
+use futures::stream::BoxStream;
+use futures::sync::mpsc::{channel, SendError};
 
 
 /// A `MultiStream` is a `Stream` implementation that abstracts over a set of underlying `Streams`,
@@ -15,32 +18,58 @@ use futures::{Async, Poll, Stream};
 /// eventually.
 pub struct MultiStream<T> {
     streams: Vec<T>,
+    newstream: Option<BoxStream<T, ()>>,
 }
 
 impl<T> MultiStream<T>
-    where T: Stream
+    where T: Stream + Send + 'static
 {
-    /// Creates a new, empty `MultiStream`.
-    pub fn new() -> MultiStream<T> {
-        MultiStream {
-            streams: vec![],
-        }
-    }
+    /// Creates a new, empty `MultiStream`, along with a `Stream` that allows adding more child
+    /// `Stream`s to this `MultiStream`.
+    pub fn new() -> (MultiStream<T>, BoxSink<T, SendError<T>>) {
+        let (send, recv) = channel(10);     // TODO: configurable?
 
-    /// Adds a new `Stream` to this `MultiStream`.
-    pub fn add(&mut self, v: T) {
-        self.streams.push(v);
+        (MultiStream {
+            streams: vec![],
+            newstream: Some(recv.boxed()),
+        }, Box::new(send))
     }
 }
 
 
 impl<T> Stream for MultiStream<T>
-    where T: Stream
+    where T: Stream + Send
 {
     type Item = T::Item;
     type Error = T::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        // Read all new streams and add them to the poll set.
+        let mut finished = false;
+        if let Some(ref mut stream) = self.newstream {
+            loop {
+                match stream.poll() {
+                    Ok(Async::Ready(Some(item))) => {
+                        self.streams.push(item);
+                    },
+                    Ok(Async::Ready(None)) => {
+                        finished = true;
+                        break;
+                    },
+                    Ok(Async::NotReady) => break,
+                    Err(_) => {
+                        // TODO: figure out what we do here?
+                        break;
+                    },
+                };
+            }
+        }
+
+        // If our new-child-Stream is finished, then we remove it so we never poll it again.
+        if finished {
+            self.newstream = None;
+        }
+
         // TODO: handle 'draining' case?
 
         let mut i = 0;
@@ -84,21 +113,30 @@ impl<T> Stream for MultiStream<T>
     }
 }
 
+/*
 #[macro_export]
 macro_rules! multistream {
     ($($e:expr),*) => ({
-        let mut _temp = $crate::MultiStream::new();
-        $(_temp.add($e);)*
+        let (mut _tempms, mut _tempstr) = $crate::MultiStream::new();
+        $(_tempstr.send($e).unwrap();)*
         _temp
     })
 }
+*/
 
 
 #[cfg(test)]
 mod tests {
     use super::MultiStream;
-    use futures::{Async, Stream};
-    use futures::stream::{once, repeat};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures::{Async, Future, Sink, Stream};
+    use futures::stream::{BoxStream, iter, once, repeat};
+
+    fn vec_stream<T>(v: Vec<T>) -> BoxStream<T, ()>
+        where T: Send + 'static,
+    {
+        Box::new(iter(v.into_iter().map(|x| Ok(x))))
+    }
 
     #[test]
     fn test_basic() {
@@ -106,15 +144,36 @@ mod tests {
         let two = once(Ok(2));
         let three = once(Ok(3));
 
-        let mut ms = MultiStream::new();
-        ms.add(one); ms.add(two); ms.add(three);
+        let (mut ms, sender) = MultiStream::new();
 
-        assert_eq!(ms.poll(), Ok(Async::Ready(Some(1))));
-        assert_eq!(ms.poll(), Ok(Async::Ready(Some(3))));   // this is swapped to the beginning
-        assert_eq!(ms.poll(), Ok(Async::Ready(Some(2))));
-        assert_eq!(ms.poll(), Ok(Async::Ready(None)));
+        // NOTE: the `unreachable!` is so we satisfy the type bound:
+        //      Self::SinkError: From<S::Error>
+        let sent = sender.send_all(
+            vec_stream(vec![
+                one, two, three,
+            ]).map_err(|_| panic!())
+        );
+
+        let run = AtomicBool::new(false);
+        let test = sent.then(|_| {
+            assert_eq!(ms.poll(), Ok(Async::Ready(Some(1))));
+            assert_eq!(ms.poll(), Ok(Async::Ready(Some(3))));   // this is swapped to the beginning
+            assert_eq!(ms.poll(), Ok(Async::Ready(Some(2))));
+            assert_eq!(ms.poll(), Ok(Async::Ready(None)));
+            run.store(true, Ordering::SeqCst);
+
+            Ok::<(), ()>(())
+        });
+
+        // Complete the above future (which runs our assertions).
+        test.wait().unwrap();
+
+        // We assert here that we actually ran our test (i.e. nothing broke that would cause the
+        // above closure/future to not run).
+        assert!(run.load(Ordering::SeqCst));
     }
 
+    /*
     #[test]
     fn test_macro() {
         let one = once::<u32, ()>(Ok(1));
@@ -128,4 +187,5 @@ mod tests {
         assert_eq!(ms.poll(), Ok(Async::Ready(Some(2))));
         assert_eq!(ms.poll(), Ok(Async::Ready(None)));
     }
+    */
 }
